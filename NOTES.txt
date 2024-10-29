@@ -1,0 +1,6 @@
+add install.sh
+that would 
+    - instsall conda if not present
+    - create the three necessary environments
+    - check if the bt2 index exists, and if not
+        - download the fasta and gtf from GENCODE and generates the indices for mm10 and hg38

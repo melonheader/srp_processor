@@ -1,0 +1,9 @@
+name: clip_dedup
+channels:
+  - bioconda
+dependencies:
+  - python=3.7*
+  - umi_tools
+  - samtools
+  - deeptools
+  - fastqc
