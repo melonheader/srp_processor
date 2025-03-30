@@ -15,9 +15,13 @@ NCORES=4
 
 usage() {
     cat <<EOF
-Usage: $0 -i <input_path> -p <processor> -g <genome_prefix> [options]
+Usage: $0 -i <input> -p <processor> -g <genome_prefix> [options]
 Options:
-  -i <input_path>       Path to SraRunTable.txt or its directory (mandatory)
+  -i <input>            Input can be:
+                         - Path to SraRunTable.txt or its directory
+                         - File containing SRA accessions (one per line)
+                         - Space-separated SRA accessions (e.g., "SRR123 SRR456")
+                         - Path/glob pattern for FASTQ files (e.g., "data/*.fastq.gz")
   -p <processor>        Processor name (used to find auxiliary scripts; mandatory)
   -g <genome_prefix>    Genome prefix for mapping (mandatory)
   -c <clip type>        CLIP type: i (iCLIP) or e (eCLIP) [default: empty]
@@ -31,7 +35,7 @@ EOF
 # Parse command-line options
 while getopts "i:o:p:g:c:a:n:" opt; do
     case "$opt" in
-        i) MINPUT="$OPTARG" ;; # Path to SraRunTable.txt or its directory
+        i) MINPUT="$OPTARG" ;; # Input (various formats supported)
         o) OUTDIR="$OPTARG" ;; # Output directory
         p) PROCESSOR="$OPTARG" ;; # Processor name
         g) GPREFIX="$OPTARG" ;; # Genome prefix
@@ -47,26 +51,86 @@ if [ -z "${MINPUT:-}" ] || [ -z "${PROCESSOR:-}" ] || [ -z "${GPREFIX:-}" ]; the
     usage
 fi
 
-# Resolve input and output directories, and locate SraRunTable.txt
-if [ "$(basename "$MINPUT")" = "SraRunTable.txt" ]; then
-    SRT_PATH="$MINPUT"
-    MINPUT_DIR=$(dirname "$MINPUT")
-    OUTDIR=${OUTDIR:-"$MINPUT_DIR"}
-elif [ -f "$MINPUT/SraRunTable.txt" ]; then 
-    SRT_PATH="$MINPUT/SraRunTable.txt"
-    MINPUT_DIR="$MINPUT"
-    OUTDIR=${OUTDIR:-"$MINPUT_DIR"}
-else
-    echo "Error: SraRunTable.txt not found at specified location" >&2
-    exit 1
-fi
-
-mkdir -p "$OUTDIR"
+# Function to parse different input types
+parse_input() {
+    local input="$1"
+    local outdir="$2"
+    
+    # Initialize empty array for run IDs
+    RUN_IDS=()
+    unset FASTQ_FILES
+    
+    # Case 1: Input is SraRunTable.txt
+    if [[ "$input" == *"SraRunTable.txt" ]] && [[ -f "$input" ]]; then
+        echo "Detected SraRunTable.txt input"
+        SRT_PATH="$input"
+        MINPUT_DIR=$(dirname "$input")
+        # Use existing parser
+        mapfile -t RUN_IDS < <(python3 "$AUXDIR/parse_srt.py" -s "$SRT_PATH" -o "$outdir")
+        return 0
+    
+    # Case 2: Input is a directory containing SraRunTable.txt
+    elif [[ -d "$input" ]] && [[ -f "$input/SraRunTable.txt" ]]; then
+        echo "Detected directory with SraRunTable.txt"
+        SRT_PATH="$input/SraRunTable.txt"
+        MINPUT_DIR="$input"
+        # Use existing parser
+        mapfile -t RUN_IDS < <(python3 "$AUXDIR/parse_srt.py" -s "$SRT_PATH" -o "$outdir")
+        return 0
+    
+    # Case 3: Input is a file with SRA accessions (one per line)
+    elif [[ -f "$input" ]] && grep -q -E "^SRR|^ERR|^DRR" "$input"; then
+        echo "Detected file with SRA accessions"
+        MINPUT_DIR=$(dirname "$input")
+        # Read accessions from file
+        mapfile -t RUN_IDS < <(grep -E "^SRR|^ERR|^DRR" "$input" | tr -d '\r')
+        return 0
+    
+    # Case 4: Input is a space-separated list of SRA accessions
+    elif [[ "$input" =~ ^(SRR|ERR|DRR)[0-9]+(\ +(SRR|ERR|DRR)[0-9]+)*$ ]]; then
+        echo "Detected space-separated SRA accessions"
+        MINPUT_DIR="$PWD"
+        # Split the input string into array
+        read -ra RUN_IDS <<< "$input"
+        return 0
+    
+    # Case 5: Input is a glob pattern for FASTQ files
+    elif compgen -G "$input" > /dev/null; then
+        echo "Detected FASTQ file pattern"
+        # Get first file's directory for default MINPUT_DIR
+        MINPUT_DIR=$(dirname "$(echo "$input" | cut -d' ' -f1)")
+        # Get the file paths using globbing
+        FASTQ_FILES=($input)
+        echo "Found ${#FASTQ_FILES[@]} FASTQ files"
+        
+        # Extract run IDs from filenames if possible
+        for file in "${FASTQ_FILES[@]}"; do
+            base=$(basename "$file")
+            # Try to extract SRA ID from filename
+            if [[ "$base" =~ ^(SRR|ERR|DRR)[0-9]+ ]]; then
+                id=${BASH_REMATCH[0]}
+                # Only add if not already in array
+                if [[ ! " ${RUN_IDS[*]} " =~ " $id " ]]; then
+                    RUN_IDS+=("$id")
+                fi
+            fi
+        done
+        return 0
+    
+    else
+        echo "Error: Could not parse input format: $input" >&2
+        return 1
+    fi
+}
 
 # Function: Download missing runs
 download_missing_runs() {
-    # Get list of RUN IDs using the parse_srt.py script
-    mapfile -t RUN_IDS < <(python3 "$AUXDIR/parse_srt.py" -s "$SRT_PATH" -o "$OUTDIR")
+    # Skip download if we're using direct FASTQ files
+    if [[ -n "${FASTQ_FILES:-}" ]]; then
+        echo "Using provided FASTQ files directly, skipping download"
+        return 0
+    fi
+    
     local missing=()
     for RUN in "${RUN_IDS[@]}"; do
         # Check if any file starting with the run ID exists in MINPUT_DIR
@@ -79,9 +143,9 @@ download_missing_runs() {
         echo "The following runs are missing and will be downloaded:"
         for RUN in "${missing[@]}"; do
             echo "Downloading $RUN..."
-            # Correct the fasterq-dump command; adjust -M flag as needed.
+            # Download run
             fasterq-dump "$RUN" --split-3 --progress --outdir "$MINPUT_DIR"
-            # Compress FASTQ files using a more specific glob pattern (e.g., *.fastq)
+            # Compress FASTQ files
             pigz -p "$NCORES" "$MINPUT_DIR/${RUN}"*.fastq
         done
     fi
@@ -89,22 +153,39 @@ download_missing_runs() {
 
 # Function: Detect mate pairs
 detect_mate_pairs() {
-    local run mfile
     MATE_1=()
     MATE_2=()
-    for run in "${RUN_IDS[@]}"; do
-        # Use globbing to detect mate files for the run
-        for mfile in "$MINPUT_DIR"/${run}*; do
-            if [[ -f "$mfile" ]]; then
-                fname=$(basename "$mfile")
-                if [[ "$fname" =~ (_1\.|R1\.) ]]; then
-                    MATE_1+=("$fname")
-                elif [[ "$fname" =~ (_2\.|R2\.) ]]; then
-                    MATE_2+=("$fname")
-                fi
+    
+    # If we have direct FASTQ files
+    if [[ -n "${FASTQ_FILES:-}" ]]; then
+        for file in "${FASTQ_FILES[@]}"; do
+            fname=$(basename "$file")
+            if [[ "$fname" =~ (_1\.|R1\.|_1$|R1$) ]]; then
+                MATE_1+=("$fname")
+            elif [[ "$fname" =~ (_2\.|R2\.|_2$|R2$) ]]; then
+                MATE_2+=("$fname")
+            else
+                # Assume single-end if no mate pattern found
+                MATE_1+=("$fname")
             fi
         done
-    done
+    else
+        # Original functionality for SRA accessions
+        local run mfile
+        for run in "${RUN_IDS[@]}"; do
+            # Use globbing to detect mate files for the run
+            for mfile in "$MINPUT_DIR"/${run}*; do
+                if [[ -f "$mfile" ]]; then
+                    fname=$(basename "$mfile")
+                    if [[ "$fname" =~ (_1\.|R1\.) ]]; then
+                        MATE_1+=("$fname")
+                    elif [[ "$fname" =~ (_2\.|R2\.) ]]; then
+                        MATE_2+=("$fname")
+                    fi
+                fi
+            done
+        done
+    fi
 
     # Provide feedback about mate detection
     if [ "${#MATE_1[@]}" -gt 0 ] && [ "${#MATE_2[@]}" -eq 0 ]; then
@@ -115,9 +196,14 @@ detect_mate_pairs() {
 }
 
 # --- MAIN EXECUTION ---
+# Parse input and determine RUN_IDS
+parse_input "$MINPUT" "${OUTDIR:-}" || usage
+
+# Set OUTDIR if not specified
+OUTDIR=${OUTDIR:-"$MINPUT_DIR"}
+mkdir -p "$OUTDIR"
+
 download_missing_runs
-# Re-read RUN_IDS in case new files were downloaded
-mapfile -t RUN_IDS < <(python3 "$AUXDIR/parse_srt.py" -s "$SRT_PATH" -o "$OUTDIR")
 detect_mate_pairs
 
 # Pre-process: check if the preprocess script exists and run it

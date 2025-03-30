@@ -1,19 +1,40 @@
-#! /usr/env/bash
-# --------------------------------------------------------------------------------
-# {INFO}
-# following the guidlines reported at https://pureclip.readthedocs.io/en/latest/GettingStarted/preprocessing.html
-# --------------------------------------------------------------------------------
-# {SETUP}
+#!/usr/bin/env bash
+# ----------------------------------------------------------------------------
+# CLIP-seq Preprocessing Script
+# 
+# Purpose: Prepare CLIP-seq fastq files for mapping by:
+#   1. Trimming adapters using cutadapt
+#   2. Extracting UMI barcodes and adding to read IDs
+#
+# Based on guidelines from: https://pureclip.readthedocs.io/en/latest/GettingStarted/preprocessing.html
+# ----------------------------------------------------------------------------
+
+# Fail on any error
 set -e
+
+# Initialize variables
 FMATES=()
+SMATES=()
 DIROUT=""
 DIRIN=""
 DIRAUX=""
 NCORES=4
-HELP() {
-    echo "Usage: $0 --mate1 FILE1 FILE2 ... --mate2  FILE1 FILE2 ... --outdir OUTPUT_DIR --indir INPUT_DIR --auxdir AUX_DIR"
+
+# Help message
+show_help() {
+    echo "Usage: $0 --mate1 FILE1 FILE2 ... --mate2 FILE1 FILE2 ... --outdir OUTPUT_DIR --indir INPUT_DIR --auxdir AUX_DIR [--ncores CORES]"
+    echo ""
+    echo "Options:"
+    echo "  --mate1       First mate (R1) fastq files"
+    echo "  --mate2       Second mate (R2) fastq files (optional)"
+    echo "  --outdir      Output directory"
+    echo "  --indir       Input directory containing raw fastq files"
+    echo "  --auxdir      Directory containing auxiliary scripts"
+    echo "  --ncores      Number of CPU cores to use (default: 4)"
     exit 1
 }
+
+# Parse command line arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --mate1)
@@ -46,25 +67,41 @@ while [[ $# -gt 0 ]]; do
             NCORES="$2"
             shift 2
             ;;
+        --help|-h)
+            show_help
+            ;;
         *)
             echo "Unknown option: $1"
-            HELP
+            show_help
             ;;
     esac
 done
+
+# Validate required arguments
 if [[ ${#FMATES[@]} -eq 0 ]] || [[ -z "$DIROUT" ]] || [[ -z "$DIRIN" ]] || [[ -z "$DIRAUX" ]]; then
-    HELP
+    echo "Error: Missing required arguments."
+    show_help
 fi
-# --------------------------------------------------------------------------------
-# {MAIN}
-if [ ! -d "$DIROUT/processed" ]; then
-    mkdir -p "$DIROUT"/processed
+
+# Create output directory
+if [[ ! -d "$DIROUT/processed" ]]; then
+    mkdir -p "$DIROUT/processed"
 fi
-DIROUT="$DIROUT"/processed
-# -------------------------------------
-# Function definitions
-TRIMAD() {
+DIROUT="$DIROUT/processed"
+
+# Log execution
+log() {
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*"
+}
+
+# ----------------------------------------------------------------------------
+# Adapter trimming function
+# Uses cutadapt to trim adapters from reads
+# ----------------------------------------------------------------------------
+trim_adapters() {
     local FMATE="" SMATE="" FEXT="" DIRIN="" DIROUT=""
+    
+    # Parse function arguments
     while [[ "$#" -gt 0 ]]; do
         case "$1" in
             --fm)
@@ -84,113 +121,156 @@ TRIMAD() {
                 shift 2
                 ;;
             *)
-                echo "Unknown option: $1" >&2
+                echo "Error: Unknown option for trim_adapters: $1" >&2
                 return 1
                 ;;
         esac
     done
-    # Check if FMATE was provided
+    
+    # Validate required arguments
     if [[ -z "$FMATE" ]]; then
-        echo "Error: FMATE (--fm) at least on read file is required" >&2
+        echo "Error: FMATE (--fm) is required for trim_adapters" >&2
         return 1
     fi
-    # shellcheck disable=SC2001
+    
+    # Extract root sample name and file extension
     ROOT=$(echo "$FMATE" | sed 's/_\(R1\|1\).*//')
     FEXT=$(find "$DIRIN" -maxdepth 1 -type f -name "$FMATE*" | head -n 1)
     FEXT=".fa${FEXT##*.fa}"
-    # -a --> 3' end of the first mate; -g --> 5' end of the first mate; -A --> 3' end of the second mate
-    ## -e (--error-rate) maximum error rate; -O minlength overlap between read and adapter; --times Remove up to COUNT adapters from each read -m
-    ## prepare a command for cutadapt
+    
+    # Process paired-end reads
     if [[ -n "$SMATE" ]]; then
-        if [ -f "$DIROUT/$FMATE"_trimmed.fastq.gz ] && [ -f "$DIROUT"/"$SMATE"_trimmed.fastq.gz ]; then
-            echo "Skipping trimming $ROOT mates; Already preprocessed"
+        # Skip if output already exists
+        if [[ -f "$DIROUT/$FMATE"_trimmed.fastq.gz ]] && [[ -f "$DIROUT/$SMATE"_trimmed.fastq.gz ]]; then
+            log "Skipping trimming $ROOT mates; Already preprocessed"
             return 0
         fi
-        echo "running cutadapt on $FMATE $SMATE; first pass"
+        
+        # First cutadapt pass
+        log "Running cutadapt on $FMATE $SMATE (pass 1)"
         cutadapt \
-            --match-read-wildcards --times 1 -e 0.1 -O 1 --quality-cutoff 6 -m 18 --cores "$NCORES" --report full --json "$DIROUT"/"$ROOT"_trimReport_1pass.txt \
+            --match-read-wildcards --times 1 -e 0.1 -O 1 --quality-cutoff 6 -m 18 \
+            --cores "$NCORES" --report full --json "$DIROUT/${ROOT}_trimReport_1pass.txt" \
             --discard-untrimmed \
             -a "NNNNNAGATCGGAAGAGCACACGTCTGAACTCCAGTCAC" \
             -g "CTTCCGATCTACAAGTT" -g "CTTCCGATCTTGGTCCT" \
             -A "AACTTGTAGATCGGA" -A "AGGACCAAGATCGGA" -A "ACTTGTAGATCGGAA" -A "GGACCAAGATCGGAA" \
-            -A CTTGTAGATCGGAAG -A GACCAAGATCGGAAG -A TTGTAGATCGGAAGA -A ACCAAGATCGGAAGA \
-            -A TGTAGATCGGAAGAG -A CCAAGATCGGAAGAG -A GTAGATCGGAAGAGC -A CAAGATCGGAAGAGC \
-            -A TAGATCGGAAGAGCG -A AAGATCGGAAGAGCG -A AGATCGGAAGAGCGT -A GATCGGAAGAGCGTC \
-            -A ATCGGAAGAGCGTCG -A TCGGAAGAGCGTCGT -A CGGAAGAGCGTCGTG -A GGAAGAGCGTCGTGT \
-            -o "$DIROUT/$FMATE"_trimmed1.fastq -p "$DIROUT/$SMATE"_trimmed1.fastq \
-            "$DIRIN"/"$FMATE$FEXT" "$DIRIN"/"$SMATE$FEXT" > /dev/null
-        wait
-        echo "running cutadapt on $FMATE $SMATE; second pass"
+            -A "CTTGTAGATCGGAAG" -A "GACCAAGATCGGAAG" -A "TTGTAGATCGGAAGA" -A "ACCAAGATCGGAAGA" \
+            -A "TGTAGATCGGAAGAG" -A "CCAAGATCGGAAGAG" -A "GTAGATCGGAAGAGC" -A "CAAGATCGGAAGAGC" \
+            -A "TAGATCGGAAGAGCG" -A "AAGATCGGAAGAGCG" -A "AGATCGGAAGAGCGT" -A "GATCGGAAGAGCGTC" \
+            -A "ATCGGAAGAGCGTCG" -A "TCGGAAGAGCGTCGT" -A "CGGAAGAGCGTCGTG" -A "GGAAGAGCGTCGTGT" \
+            -o "$DIROUT/${FMATE}_trimmed1.fastq" -p "$DIROUT/${SMATE}_trimmed1.fastq" \
+            "$DIRIN/${FMATE}${FEXT}" "$DIRIN/${SMATE}${FEXT}" > /dev/null
+        
+        # Second cutadapt pass
+        log "Running cutadapt on $FMATE $SMATE (pass 2)"
         cutadapt \
-            --match-read-wildcards --times 1 -e 0.1 -O 5 --quality-cutoff 6 -m 18 --cores "$NCORES" --report full --json "$DIROUT"/"$ROOT"_trimReport_2pass.txt \
+            --match-read-wildcards --times 1 -e 0.1 -O 5 --quality-cutoff 6 -m 18 \
+            --cores "$NCORES" --report full --json "$DIROUT/${ROOT}_trimReport_2pass.txt" \
             --discard-untrimmed \
-            -A AACTTGTAGATCGGA -A AGGACCAAGATCGGA -A ACTTGTAGATCGGAA -A GGACCAAGATCGGAA \
-            -A CTTGTAGATCGGAAG -A GACCAAGATCGGAAG -A TTGTAGATCGGAAGA -A ACCAAGATCGGAAGA \
-            -A TGTAGATCGGAAGAG -A CCAAGATCGGAAGAG -A GTAGATCGGAAGAGC -A CAAGATCGGAAGAGC \
-            -A TAGATCGGAAGAGCG -A AAGATCGGAAGAGCG -A AGATCGGAAGAGCGT -A GATCGGAAGAGCGTC \
-            -A ATCGGAAGAGCGTCG -A TCGGAAGAGCGTCGT -A CGGAAGAGCGTCGTG -A GGAAGAGCGTCGTGT \
-            -o "$DIROUT/$FMATE"_trimmed.fastq -p "$DIROUT/$SMATE"_trimmed.fastq \
-            "$DIROUT/$FMATE"_trimmed1.fastq "$DIROUT/$SMATE"_trimmed1.fastq > /dev/null
-        wait
-        rm "$DIROUT/$FMATE"_trimmed1.fastq "$DIROUT/$SMATE"_trimmed1.fastq
-        pigz -p "$NCORES" "$DIROUT/$FMATE"_trimmed.fastq "$DIROUT/$SMATE"_trimmed.fastq
-        #python3 "$DIRAUX"/parse_trimreport.py -j "$DIROUT"/"$ROOT"_trimReport_1pass.txt -c "$DIROUT"/"$ROOT"_trimReport_1pass.csv
-        #python3 "$DIRAUX"/parse_trimreport.py -j "$DIROUT"/"$ROOT"_trimReport_2pass.txt -c "$DIROUT"/"$ROOT"_trimReport_2pass.csv
+            -A "AACTTGTAGATCGGA" -A "AGGACCAAGATCGGA" -A "ACTTGTAGATCGGAA" -A "GGACCAAGATCGGAA" \
+            -A "CTTGTAGATCGGAAG" -A "GACCAAGATCGGAAG" -A "TTGTAGATCGGAAGA" -A "ACCAAGATCGGAAGA" \
+            -A "TGTAGATCGGAAGAG" -A "CCAAGATCGGAAGAG" -A "GTAGATCGGAAGAGC" -A "CAAGATCGGAAGAGC" \
+            -A "TAGATCGGAAGAGCG" -A "AAGATCGGAAGAGCG" -A "AGATCGGAAGAGCGT" -A "GATCGGAAGAGCGTC" \
+            -A "ATCGGAAGAGCGTCG" -A "TCGGAAGAGCGTCGT" -A "CGGAAGAGCGTCGTG" -A "GGAAGAGCGTCGTGT" \
+            -o "$DIROUT/${FMATE}_trimmed.fastq" -p "$DIROUT/${SMATE}_trimmed.fastq" \
+            "$DIROUT/${FMATE}_trimmed1.fastq" "$DIROUT/${SMATE}_trimmed1.fastq" > /dev/null
+        
+        # Clean up intermediate files and compress output
+        rm "$DIROUT/${FMATE}_trimmed1.fastq" "$DIROUT/${SMATE}_trimmed1.fastq"
+        log "Compressing output files"
+        pigz -p "$NCORES" "$DIROUT/${FMATE}_trimmed.fastq" "$DIROUT/${SMATE}_trimmed.fastq"
+        
+    # Process single-end reads
     else
-        if [ -f "$DIROUT/$FMATE"_trimmed.fastq.gz ]; then
-            echo "Skipping trimming $ROOT; Already preprocessed"
+        # Skip if output already exists
+        if [[ -f "$DIROUT/${FMATE}_trimmed.fastq.gz" ]]; then
+            log "Skipping trimming $ROOT; Already preprocessed"
             return 0
         fi
-        echo "running cutadapt on $FMATE"
+        
+        log "Running cutadapt on $FMATE"
         cutadapt \
-            --match-read-wildcards --times 1 -e 0.1 -O 1 --quality-cutoff 6 -m 18 --cores "$NCORES" --report full --json "$DIROUT"/"$ROOT"_trimReport.txt \
+            --match-read-wildcards --times 1 -e 0.1 -O 1 --quality-cutoff 6 -m 18 \
+            --cores "$NCORES" --report full --json "$DIROUT/${ROOT}_trimReport.txt" \
             --discard-untrimmed \
             -a "NNNNNAGATCGGAAGAGCACACGTCTGAACTCCAGTCAC" \
             -g "CTTCCGATCTACAAGTT" -g "CTTCCGATCTTGGTCCT" \
-            -o "$DIROUT/$FMATE"_trimmed.fastq \
-            "$DIRIN"/"$FMATE$FEXT" > /dev/null
-        wait
-        pigz -p "$NCORES" "$DIROUT/$FMATE"_trimmed.fastq
-        #python3 "$DIRAUX"/parse_trimreport.py -j "$DIROUT"/"$ROOT"_trimReport.txt -c "$DIROUT"/"$ROOT"_trimReport.csv
+            -o "$DIROUT/${FMATE}_trimmed.fastq" \
+            "$DIRIN/${FMATE}${FEXT}" > /dev/null
+        
+        # Compress output
+        log "Compressing output file"
+        pigz -p "$NCORES" "$DIROUT/${FMATE}_trimmed.fastq"
     fi
 }
-GETBARCODES() {
-    local FMATE=$1
-    local SMATE=$2
-    # shellcheck disable=SC2001
+
+# ----------------------------------------------------------------------------
+# Extract UMI barcodes and add to read IDs
+# ----------------------------------------------------------------------------
+extract_barcodes() {
+    local FMATE="$1"
+    local SMATE="$2"
+    
+    # Extract root sample name
     ROOT=$(echo "$FMATE" | sed 's/_\(R1\|1\).*//')
+    
+    # Check if files already processed
     if [[ -z "$SMATE" ]]; then
-        if [ -f "$DIROUT"/"$FMATE"_trimmed_bc.fastq.gz ]; then
-            echo "Skipping UMI barcoding step for $ROOT; UMI barcodes are already in read IDs"
+        if [[ -f "$DIROUT/${FMATE}_trimmed_bc.fastq.gz" ]]; then
+            log "Skipping UMI extraction for $ROOT; UMI barcodes are already in read IDs"
             return 0
         fi
     else
-        if [ -f "$DIROUT"/"$FMATE"_trimmed_bc.fastq.gz ] && [ -f "$DIROUT"/"$SMATE"_trimmed_bc.fastq.gz ]; then
-            echo "Skipping UMI barcoding step for $ROOT mates; UMI barcodes are already in read IDs"
+        if [[ -f "$DIROUT/${FMATE}_trimmed_bc.fastq.gz" ]] && [[ -f "$DIROUT/${SMATE}_trimmed_bc.fastq.gz" ]]; then
+            log "Skipping UMI extraction for $ROOT mates; UMI barcodes are already in read IDs"
             return 0
         fi
     fi
-    echo "moving UMI barcodes to the read ID..."
+    
+    log "Moving UMI barcodes to read IDs for $ROOT"
+    
+    # Process mates
     if [[ -n "$SMATE" ]]; then
         for MATE in "$FMATE" "$SMATE"; do
-            zcat "$DIROUT"/"$MATE"_trimmed.fastq.gz | awk -v l=10 \
-                'BEGIN{OFS=FS=" "} substr($1, 1, 1) == "@" {print "@" substr($1, (l+3), 500) "_" substr($1, 2, l) " " $2 }; substr($1, 1, 1) != "@" {print}; ' |\
-                pigz -p "$NCORES" > "$DIROUT"/"$MATE"_trimmed_bc.fastq.gz
+            log "Processing $MATE"
+            zcat "$DIROUT/${MATE}_trimmed.fastq.gz" | awk -v l=10 \
+                'BEGIN{OFS=FS=" "} 
+                 substr($1, 1, 1) == "@" {print "@" substr($1, (l+3), 500) "_" substr($1, 2, l) " " $2}; 
+                 substr($1, 1, 1) != "@" {print}' | \
+                pigz -p "$NCORES" > "$DIROUT/${MATE}_trimmed_bc.fastq.gz"
         done
     else
-            zcat "$DIROUT"/"$FMATE"_trimmed.fastq.gz | awk -v l=10 \
-                'BEGIN{OFS=FS=" "} substr($1, 1, 1) == "@" {print "@" substr($1, (l+3), 500) "_" substr($1, 2, l) " " $2 }; substr($1, 1, 1) != "@" {print}; ' |\
-                pigz -p "$NCORES" > "$DIROUT"/"$FMATE"_trimmed_bc.fastq.gz
+        zcat "$DIROUT/${FMATE}_trimmed.fastq.gz" | awk -v l=10 \
+            'BEGIN{OFS=FS=" "} 
+             substr($1, 1, 1) == "@" {print "@" substr($1, (l+3), 500) "_" substr($1, 2, l) " " $2}; 
+             substr($1, 1, 1) != "@" {print}' | \
+            pigz -p "$NCORES" > "$DIROUT/${FMATE}_trimmed_bc.fastq.gz"
     fi
 }
-# --------------------------------------------------------------------------------
-# {EXECUTE}
+
+# ----------------------------------------------------------------------------
+# Main execution
+# ----------------------------------------------------------------------------
+# Activate conda environment
+log "Activating conda environment: clip_preprocess"
 eval "$(conda shell.bash hook)"
 conda activate clip_preprocess
-echo "-----------------------------------------------------------------------"
-echo preprocessing
+
+log "Starting CLIP-seq preprocessing"
+log "Found ${#FMATES[@]} samples to process"
+
+# Process each sample
 for IDX in "${!FMATES[@]}"; do
-    echo "------------------------------------------------"
-    TRIMAD --fm "${FMATES[$IDX]}" --sm "${SMATES[$IDX]}" --di "$DIRIN" --do "$DIROUT"; wait
-    GETBARCODES "${FMATES[$IDX]}" "${SMATES[$IDX]}" ; wait
+    log "Processing sample ${IDX+1}/${#FMATES[@]}: ${FMATES[$IDX]}"
+    
+    # Trim adapters
+    trim_adapters --fm "${FMATES[$IDX]}" --sm "${SMATES[$IDX]}" --di "$DIRIN" --do "$DIROUT"
+    
+    # Extract UMI barcodes
+    extract_barcodes "${FMATES[$IDX]}" "${SMATES[$IDX]}"
+    
+    log "Completed processing ${FMATES[$IDX]}"
 done
+
+log "Preprocessing completed successfully"

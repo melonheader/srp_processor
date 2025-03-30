@@ -1,11 +1,13 @@
 #! /usr/env/bash
 # --------------------------------------------------------------------------------
 # {INFO}
-# following the guidlines reported at https://pureclip.readthedocs.io/en/latest/GettingStarted/preprocessing.html
+# Refactored version of the original script, replacing TopHat2 with STAR
+# following the guidelines reported at https://pureclip.readthedocs.io/en/latest/GettingStarted/preprocessing.html
 # --------------------------------------------------------------------------------
 # {SETUP}
 set -e
 FMATES=()
+SMATES=()
 DIROUT=""
 DIRIN=""
 DIRAUX=""
@@ -13,7 +15,7 @@ GPREFIX=""
 CLIPTYP=""
 NCORES=4
 HELP() {
-    echo "Usage: $0 --mate1 FILE1 FILE2 ... --mate2  FILE1 FILE2 ... --outdir OUTPUT_DIR --indir INPUT_DIR --genome GPREFIX --cliptyp CLIPTYP --auxdir AUX_DIR"
+    echo "Usage: $0 --mate1 FILE1 FILE2 ... --mate2 FILE1 FILE2 ... --outdir OUTPUT_DIR --indir INPUT_DIR --genome GPREFIX --cliptyp CLIPTYP --auxdir AUX_DIR"
     exit 1
 }
 while [[ $# -gt 0 ]]; do
@@ -74,10 +76,10 @@ DIROUT="$DIROUT"/mapped
 if [ -d "$DIRIN/processed" ]; then
     DIRIN="$DIRIN/processed"
 fi
-GIDXLOC="$DIRAUX"/Annotations/Gencode/Indices/bowtie2/"$GPREFIX"
+GIDXLOC="$DIRAUX"/Annotations/Gencode/Indices/star/"$GPREFIX"
 # -------------------------------------
 # Function definitions
-TH2MAP() {
+STARMAP() {
     local FMATE="" SMATE="" GIDX="" DIROUT="" NCORES="4" 
     while [[ "$#" -gt 0 ]]; do
         case "$1" in
@@ -109,35 +111,54 @@ TH2MAP() {
     done
     # shellcheck disable=SC2001
     ROOT=$(echo "$FMATE" | sed 's/_\(R1\|1\).*//')
+    # Create a temporary directory for STAR output
+    STAR_TMP="$DIROUT"/"$ROOT"_star_tmp
+    
     if [ -n "$SMATE" ]; then
         if [ ! -f "$DIROUT/$ROOT.bam" ]; then
             echo mapping "$FMATE" "$SMATE"
-            tophat2 -p "$NCORES" \
-                --library-type fr-secondstrand \
-                --min-intron-length 20 \
-                --max-intron-length 1000000 \
-                --read-mismatches 2 \
-                --read-edit-dist 2 \
-                --min-anchor-length 8 \
-                --max-multihits 1 \
-                --segment-mismatches 3 \
-                --segment-length 25 \
-                --no-coverage-search \
-                --output-dir "$DIROUT"/  \
-                "$GIDX" \
-                "$DIRIN"/"$FMATE"_trimmed_bc.fastq.gz "$DIRIN/$SMATE"_trimmed_bc.fastq.gz
+            
+            # Create temporary directory if it doesn't exist
+            if [ ! -d "$STAR_TMP" ]; then
+                mkdir -p "$STAR_TMP"
+            fi
+            
+            # Run STAR for paired-end reads
+            STAR --runThreadN "$NCORES" \
+                --genomeDir "$GIDX" \
+                --readFilesIn "$DIRIN"/"$FMATE"_trimmed_bc.fastq.gz "$DIRIN"/"$SMATE"_trimmed_bc.fastq.gz \
+                --readFilesCommand zcat \
+                --outFileNamePrefix "$STAR_TMP"/ \
+                --outSAMtype BAM SortedByCoordinate \
+                --outSAMattributes Standard \
+                --outFilterMultimapNmax 1 \
+                --outFilterMismatchNmax 2 \
+                --alignIntronMin 20 \
+                --alignIntronMax 1000000 \
+                --outFilterScoreMinOverLread 0.2 \
+                --outFilterMatchNminOverLread 0.2 \
+                --limitBAMsortRAM 10000000000 \
+                --quantMode GeneCounts \
+                --twopassMode Basic
+            
             wait
-            mv "$DIROUT"/accepted_hits.bam "$DIROUT"/"$ROOT".bam
-            mv "$DIROUT"/unmapped.bam "$DIROUT"/"$ROOT".bam
-            for REP in deletions.bed insertions.bed junctions.bed align_summary.txt prep_reads.info logs; do
-                if [ ! -d "$DIROUT"/"$ROOT" ]; then
-                    mkdir "$DIROUT"/"$ROOT"
-                fi
-                mv "$DIROUT"/"$REP" "$DIROUT"/"$ROOT"/"$REP"
-            done
+            # Move and rename the output files
+            mv "$STAR_TMP"/Aligned.sortedByCoord.out.bam "$DIROUT"/"$ROOT".bam
+            
+            # Create a directory for additional STAR outputs if needed
+            if [ ! -d "$DIROUT"/"$ROOT" ]; then
+                mkdir "$DIROUT"/"$ROOT"
+            fi
+            
+            # Move other STAR output files to the directory
+            mv "$STAR_TMP"/* "$DIROUT"/"$ROOT"/
+            
+            # Remove temporary directory
+            rmdir "$STAR_TMP"
+            
         elif [ ! -f "$DIROUT"/"$ROOT"_filtered.bam.bai ]; then
             echo filtering and indexing "$ROOT".bam
-            SAMFILT --run "$ROOT" --out "$DIROUT"
+            SAMFILT --run "$ROOT" --out "$DIROUT" --paired
         else
             echo Output bam file detected. Skipping "$FMATE" "$SMATE"
             return 0
@@ -145,29 +166,45 @@ TH2MAP() {
     else
         if [ ! -f "$DIROUT/$ROOT.bam" ]; then
             echo mapping "$FMATE"
-            tophat2 -p "$NCORES" \
-                --library-type fr-secondstrand \
-                --min-intron-length 20 \
-                --max-intron-length 1000000 \
-                --read-mismatches 2 \
-                --read-edit-dist 2 \
-                --min-anchor-length 8 \
-                --max-multihits 1 \
-                --segment-mismatches 3 \
-                --segment-length 20 \
-                --no-coverage-search \
-                --output-dir "$DIROUT"/  \
-                "$GIDX" \
-                "$DIRIN"/"$FMATE"_trimmed_bc.fastq.gz
+            
+            # Create temporary directory if it doesn't exist
+            if [ ! -d "$STAR_TMP" ]; then
+                mkdir -p "$STAR_TMP"
+            fi
+            
+            # Run STAR for single-end reads
+            STAR --runThreadN "$NCORES" \
+                --genomeDir "$GIDX" \
+                --readFilesIn "$DIRIN"/"$FMATE"_trimmed_bc.fastq.gz \
+                --readFilesCommand zcat \
+                --outFileNamePrefix "$STAR_TMP"/ \
+                --outSAMtype BAM SortedByCoordinate \
+                --outSAMattributes Standard \
+                --outFilterMultimapNmax 1 \
+                --outFilterMismatchNmax 2 \
+                --alignIntronMin 20 \
+                --alignIntronMax 1000000 \
+                --outFilterScoreMinOverLread 0.2 \
+                --outFilterMatchNminOverLread 0.2 \
+                --limitBAMsortRAM 10000000000 \
+                --quantMode GeneCounts \
+                --twopassMode Basic
+            
             wait
-            mv "$DIROUT"/accepted_hits.bam "$DIROUT"/"$ROOT".bam
-            mv "$DIROUT"/unmapped.bam "$DIROUT"/"$ROOT"_unmapped.bam
-            for REP in deletions.bed insertions.bed junctions.bed align_summary.txt prep_reads.info logs; do
-                if [ ! -d "$DIROUT"/"$ROOT" ]; then
-                    mkdir "$DIROUT"/"$ROOT"
-                fi
-                mv "$DIROUT"/"$REP" "$DIROUT"/"$ROOT"/"$REP"
-            done
+            # Move and rename the output files
+            mv "$STAR_TMP"/Aligned.sortedByCoord.out.bam "$DIROUT"/"$ROOT".bam
+            
+            # Create a directory for additional STAR outputs if needed
+            if [ ! -d "$DIROUT"/"$ROOT" ]; then
+                mkdir "$DIROUT"/"$ROOT"
+            fi
+            
+            # Move other STAR output files to the directory
+            mv "$STAR_TMP"/* "$DIROUT"/"$ROOT"/
+            
+            # Remove temporary directory
+            rmdir "$STAR_TMP"
+            
         elif [ ! -f "$DIROUT"/"$ROOT"_filtered.bam.bai ]; then
             echo filtering and indexing "$ROOT".bam
             SAMFILT --run "$ROOT" --out "$DIROUT"
@@ -220,7 +257,7 @@ SAMFILT() {
     fi
 }
 DEDUP() {
-    local REPARR=() GROUP="" PAIRED="" DIROUT="" 
+    local REPARR=() GROUP="" PAIRED="" DIROUT="" REPS=()
     while [[ "$#" -gt 0 ]]; do
         case "$1" in
             --input_arr)
@@ -255,6 +292,7 @@ DEDUP() {
                 umi_tools dedup -I "$DIROUT"/"${REPARR[$IDX]}"_filtered.bam --paired \
                     -S "$DIROUT"/"${REPARR[$IDX]}"_"$GROUP"_rep$(("$IDX" + 1))_filtered_dedup.bam
             done
+            REPS=()
             for IDX in "${!REPARR[@]}"; do
                 REPS+=("$DIROUT"/"${REPARR[$IDX]}"_"$GROUP"_rep$(("$IDX" + 1))_filtered_dedup.bam)
             done
@@ -262,13 +300,17 @@ DEDUP() {
             samtools merge -f "$DIROUT"/"$GROUP"_merged_filtered_dedup.bam "${REPS[@]}"
         elif [ ! -f "$DIROUT"/"$GROUP"_merged_filtered_dedup.bam.bai ]; then
             echo indexing merged "${REPARR[@]}"
-            samtools index "$DIROUT"/"$GROUP"_merged_filtered_dedup.bam "${REPS[@]}"
+            samtools index "$DIROUT"/"$GROUP"_merged_filtered_dedup.bam
         else
             echo merged and deduplicated bam detected, skipping step for "${REPARR[@]}"
         fi
         if [ "$CLIPTYP" == "e" ]; then
-            samtools view -hb -f 130 "$DIROUT"/"$GROUP"_merged_filtered_dedup.bam -o "$DIROUT"/"$GROUP"_merged.R2_filtered_dedup.bam
-            if [ ! -f "$DIROUT"/"$GROUP"_merged_filtered.R2_dedup_pos.bw ] && [ ! -f "$DIROUT"/"$GROUP"_merged.R2_filtered_dedup_neg.bw ]; then
+            if [ ! -f "$DIROUT"/"$GROUP"_merged.R2_filtered_dedup.bam ]; then
+                echo "Extracting R2 reads for eCLIP data"
+                samtools view -hb -f 130 "$DIROUT"/"$GROUP"_merged_filtered_dedup.bam -o "$DIROUT"/"$GROUP"_merged.R2_filtered_dedup.bam
+            fi
+            if [ ! -f "$DIROUT"/"$GROUP"_merged.R2_filtered_dedup_pos.bw ] && [ ! -f "$DIROUT"/"$GROUP"_merged.R2_filtered_dedup_neg.bw ]; then
+                echo "Generating bigwigs for eCLIP data"
                 bamCoverage \
                 -b "$DIROUT"/"$GROUP"_merged.R2_filtered_dedup.bam \
                 --filterRNAstrand forward --normalizeUsing None \
@@ -279,15 +321,18 @@ DEDUP() {
                 -o "$DIROUT"/"$GROUP"_merged.R2_filtered_dedup_neg.bw
             fi
         elif [ "$CLIPTYP" == "i" ]; then
-            samtools view -hb -f 66 "$DIROUT"/"$GROUP"_merged_filtered_dedup.bam -o "$DIROUT"/"$GROUP"_merged.R1_filtered_dedup.bam
-            if [ ! -f "$DIROUT"/"$GROUP"_merged_filtered.R1_dedup_pos.bw ] && [ ! -f "$DIROUT"/"$GROUP"_merged.R1_filtered_dedup_neg.bw ]; then
-                echo generating bigwigs
+            if [ ! -f "$DIROUT"/"$GROUP"_merged.R1_filtered_dedup.bam ]; then
+                echo "Extracting R1 reads for iCLIP data"
+                samtools view -hb -f 66 "$DIROUT"/"$GROUP"_merged_filtered_dedup.bam -o "$DIROUT"/"$GROUP"_merged.R1_filtered_dedup.bam
+            fi
+            if [ ! -f "$DIROUT"/"$GROUP"_merged.R1_filtered_dedup_pos.bw ] && [ ! -f "$DIROUT"/"$GROUP"_merged.R1_filtered_dedup_neg.bw ]; then
+                echo "Generating bigwigs for iCLIP data"
                 bamCoverage \
                 -b "$DIROUT"/"$GROUP"_merged.R1_filtered_dedup.bam \
                 --filterRNAstrand forward --normalizeUsing None \
                 -o "$DIROUT"/"$GROUP"_merged.R1_filtered_dedup_pos.bw; wait
                 bamCoverage \
-                -b "$DIROUT"/"$GROUP"_merged.R12_filtered_dedup.bam \
+                -b "$DIROUT"/"$GROUP"_merged.R1_filtered_dedup.bam \
                 --filterRNAstrand reverse --normalizeUsing None \
                 -o "$DIROUT"/"$GROUP"_merged.R1_filtered_dedup_neg.bw
             fi
@@ -301,6 +346,7 @@ DEDUP() {
                     -L "$DIROUT"/"${REPARR[$IDX]}"_"$GROUP"_rep$(("$IDX" + 1))_filtered.dedupLog \
                     -E "$DIROUT"/"${REPARR[$IDX]}"_"$GROUP"_rep$(("$IDX" + 1))_filtered.dedupErr
             done
+            REPS=()
             for IDX in "${!REPARR[@]}"; do
                 REPS+=("$DIROUT"/"${REPARR[$IDX]}"_"$GROUP"_rep$(("$IDX" + 1))_filtered_dedup.bam)
             done
@@ -308,7 +354,7 @@ DEDUP() {
             samtools merge -f "$DIROUT"/"$GROUP"_merged_filtered_dedup.bam "${REPS[@]}"  
         elif [ ! -f "$DIROUT"/"$GROUP"_merged_filtered_dedup.bam.bai ]; then
             echo indexing merged "${REPARR[@]}"
-            samtools index "$DIROUT"/"$GROUP"_merged_filtered_dedup.bam "${REPS[@]}"
+            samtools index "$DIROUT"/"$GROUP"_merged_filtered_dedup.bam
         else
             echo merged and deduplicated bam detected, skipping step for "${REPARR[@]}"
         fi
@@ -328,12 +374,14 @@ DEDUP() {
 # --------------------------------------------------------------------------------
 # {EXECUTE}
 eval "$(conda shell.bash hook)"
-conda activate clip_map
+# Changing conda environment name from clip_map to clip_star for STAR aligner
+conda activate clip_star
 echo "-----------------------------------------------------------------------"
-echo mapping with TopHat2
+echo "Mapping with STAR aligner"
 for IDX in "${!FMATES[@]}"; do
     echo "------------------------------------------------"
-    TH2MAP --fm "${FMATES[$IDX]}" --sm "${SMATES[$IDX]}" --gi "$GIDXLOC" --o "$DIROUT" --nc "$NCORES"; wait
+    # Changed function name from TH2MAP to STARMAP
+    STARMAP --fm "${FMATES[$IDX]}" --sm "${SMATES[$IDX]:-}" --gi "$GIDXLOC" --o "$DIROUT" --nc "$NCORES"; wait
 done
 conda deactivate
 conda activate clip_dedup
