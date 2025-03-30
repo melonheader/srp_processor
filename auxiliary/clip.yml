@@ -1,0 +1,13 @@
+name: clip_processor
+channels:
+  - bioconda
+  - conda-forge
+dependencies:
+  - python=3.10
+  - star=2.7.10a
+  - cutadapt=5.0.
+  - pigz
+  - umi_tools
+  - samtools
+  - deeptools
+  - fastqc
